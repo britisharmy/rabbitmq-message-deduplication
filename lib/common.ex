@@ -16,13 +16,11 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Common do
 
   require RabbitMQ.MessageDeduplicationPlugin.Cache
 
-  alias RabbitMQ.MessageDeduplicationPlugin.Cache, as: MessageCache
+  alias :rabbit_binary_parser, as: RabbitBinaryParser
+  alias RabbitMQ.MessageDeduplicationPlugin.Cache, as: Cache
 
   defrecord :content, extract(
     :content, from_lib: "rabbit_common/include/rabbit.hrl")
-
-  defrecord :amqqueue, extract(
-    :amqqueue, from_lib: "rabbit_common/include/rabbit.hrl")
 
   @type basic_message :: record(:basic_message)
   defrecord :basic_message, extract(
@@ -31,22 +29,26 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Common do
   defrecord :basic_properties, :P_basic, extract(
     :P_basic, from_lib: "rabbit_common/include/rabbit_framing.hrl")
 
+  @default_arguments %{type: nil, default: nil}
+
   @doc """
-  Retrieve Cache related information from a list of exchange or queue arguments.
+  Retrieve a configuration value from a list of exchange or queue arguments.
   """
-  @spec cache_argument(list, String.t, atom, any) :: String.t | nil
-  def cache_argument(arguments, argument, type \\ nil, default \\ nil) do
+  @spec rabbit_argument(list, String.t, List.t) :: String.t | nil
+  def rabbit_argument(arguments, argument, opts \\ []) do
+    %{type: type, default: default} = Enum.into(opts, @default_arguments)
+
     case type do
-      :number -> case rabbitmq_keyfind(arguments, argument, default) do
+      :number -> case rabbit_keyfind(arguments, argument, default) do
                    number when is_bitstring(number) -> String.to_integer(number)
                    integer when is_integer(integer) -> integer
                    ^default -> default
                  end
-      :atom -> case rabbitmq_keyfind(arguments, argument, default) do
+      :atom -> case rabbit_keyfind(arguments, argument, default) do
                  string when is_bitstring(string) -> String.to_atom(string)
                  ^default -> default
                end
-      nil -> rabbitmq_keyfind(arguments, argument, default)
+      nil -> rabbit_keyfind(arguments, argument, default)
     end
   end
 
@@ -54,13 +56,13 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Common do
   Retrieve the given header from the message.
   """
   @spec message_header(basic_message, String.t) :: String.t | nil
-  def message_header(basic_message(content:
-      content(properties: properties)), header) do
-    case properties do
+  def message_header(basic_message(content: message_content), header) do
+    message_content = RabbitBinaryParser.ensure_content_decoded(message_content)
+
+    case content(message_content, :properties) do
       basic_properties(headers: headers) when is_list(headers) ->
-        rabbitmq_keyfind(headers, header)
+        rabbit_keyfind(headers, header)
       basic_properties(headers: :undefined) -> nil
-      :undefined -> nil
     end
   end
 
@@ -74,12 +76,10 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Common do
     cache = cache_name(name)
 
     case message_header(message, "x-deduplication-header") do
-      key when not is_nil(key) ->
-        case MessageCache.member?(cache, key) do
-          false -> MessageCache.put(cache, key, ttl)
-                   false
-          true -> true
-        end
+      key when not is_nil(key) -> case Cache.insert(cache, key, ttl) do
+                                    {:ok, :exists} -> true
+                                    {:ok, :inserted} -> false
+                                  end
       nil -> false
     end
   end
@@ -103,7 +103,7 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Common do
     String.to_atom("cache_queue_#{resource}_#{queue}")
   end
 
-  defp rabbitmq_keyfind(list, key, default \\ nil) do
+  defp rabbit_keyfind(list, key, default \\ nil) do
     case List.keyfind(list, key, 0) do
       {_key, _type, value} -> value
       _ -> default

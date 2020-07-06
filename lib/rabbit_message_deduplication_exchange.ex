@@ -5,7 +5,6 @@
 # Copyright (c) 2017-2018, Matteo Cafasso.
 # All rights reserved.
 
-
 defmodule RabbitMQ.MessageDeduplicationPlugin.Exchange do
   @moduledoc """
   This module adds support for deduplication exchanges.
@@ -27,15 +26,14 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Exchange do
 
   require RabbitMQ.MessageDeduplicationPlugin.Cache
   require RabbitMQ.MessageDeduplicationPlugin.Common
-  require RabbitMQ.MessageDeduplicationPlugin.Supervisor
 
   alias :rabbit_log, as: RabbitLog
   alias :rabbit_misc, as: RabbitMisc
   alias :rabbit_router, as: RabbitRouter
   alias :rabbit_exchange, as: RabbitExchange
-  alias RabbitMQ.MessageDeduplicationPlugin.Cache, as: MessageCache
   alias RabbitMQ.MessageDeduplicationPlugin.Common, as: Common
-  alias RabbitMQ.MessageDeduplicationPlugin.Supervisor, as: CacheSupervisor
+  alias RabbitMQ.MessageDeduplicationPlugin.Cache, as: Cache
+  alias RabbitMQ.MessageDeduplicationPlugin.CacheManager, as: CacheManager
 
   @behaviour :rabbit_exchange_type
 
@@ -72,15 +70,16 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Exchange do
   end
 
   def route(exchange(name: name), delivery(message: msg = basic_message())) do
-    case route?(name, msg) do
-      true -> RabbitRouter.match_routing_key(name, [:_])
-      false -> []
+    if route?(name, msg) do
+      RabbitRouter.match_routing_key(name, [:_])
+    else
+      []
     end
   end
 
   def validate(exchange(arguments: args)) do
     case List.keyfind(args, "x-cache-size", 0) do
-      {"x-cache-size", :long, val} when val > 0 -> :ok
+      {"x-cache-size", _, val} when is_integer(val) and val > 0 -> :ok
       {"x-cache-size", :longstr, val} ->
         case Integer.parse(val, 10) do
           :error -> RabbitMisc.protocol_error(
@@ -98,7 +97,7 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Exchange do
 
     case List.keyfind(args, "x-cache-ttl", 0) do
       nil -> :ok
-      {"x-cache-ttl", :long, val} when val > 0 -> :ok
+      {"x-cache-ttl", _, val} when is_integer(val) and val > 0 -> :ok
       {"x-cache-ttl", :longstr, val} ->
         case Integer.parse(val, 10) do
           :error -> RabbitMisc.protocol_error(
@@ -130,28 +129,26 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Exchange do
 
   def create(:transaction, exchange(name: name, arguments: args)) do
     cache = Common.cache_name(name)
-    options = [size: Common.cache_argument(args, "x-cache-size", :number),
-               ttl: Common.cache_argument(args, "x-cache-ttl", :number),
-               persistence: Common.cache_argument(
-                 args, "x-cache-persistence", :atom, "memory")]
+    options = [size: Common.rabbit_argument(
+                 args, "x-cache-size", type: :number),
+               ttl: Common.rabbit_argument(
+                 args, "x-cache-ttl", type: :number),
+               persistence: Common.rabbit_argument(
+                 args, "x-cache-persistence", type: :atom, default: "memory")]
 
     RabbitLog.debug(
       "Starting exchange deduplication cache ~s with options ~p~n",
       [cache, options])
 
-    CacheSupervisor.start_cache(cache, options)
+    CacheManager.create(cache, options)
   end
 
-  def create(:none, _ex) do
+  def create(_tx, _ex) do
     :ok
   end
 
   def delete(:transaction, exchange(name: name), _bs) do
-    cache = Common.cache_name(name)
-
-    :ok = MessageCache.drop(cache)
-
-    CacheSupervisor.stop_cache(cache)
+    name |> Common.cache_name() |> CacheManager.destroy()
   end
 
   def delete(:none, _ex, _bs) do
@@ -179,7 +176,7 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Exchange do
   end
 
   def info(exchange(name: name), [:cache_info]) do
-    [cache_info: name |> Common.cache_name() |> MessageCache.info()]
+    [cache_info: name |> Common.cache_name() |> Cache.info()]
   end
 
   def info(_ex, _it) do

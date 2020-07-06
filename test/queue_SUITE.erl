@@ -24,7 +24,8 @@ groups() ->
                                deduplicate_message,
                                deduplicate_message_ttl,
                                message_acknowledged,
-                               queue_overflow
+                               queue_overflow,
+                               dead_letter
                               ]}
     ].
 
@@ -72,11 +73,37 @@ deduplicate_message(Config) ->
     bind_new_exchange(Channel, <<"test">>, <<"test">>),
 
     %% Deduplication header present
+    %% String
     publish_message(Channel, <<"test">>, "deduplicate-this"),
     publish_message(Channel, <<"test">>, "deduplicate-this"),
 
-    {#'basic.get_ok'{}, _} = amqp_channel:call(Channel, Get),
+    {#'basic.get_ok'{delivery_tag = Tag1}, _} = amqp_channel:call(Channel, Get),
     #'basic.get_empty'{} = amqp_channel:call(Channel, Get),
+    amqp_channel:cast(Channel, #'basic.ack'{delivery_tag = Tag1}),
+
+    %% Integer
+    publish_message(Channel, <<"test">>, 42),
+    publish_message(Channel, <<"test">>, 42),
+
+    {#'basic.get_ok'{delivery_tag = Tag2}, _} = amqp_channel:call(Channel, Get),
+    #'basic.get_empty'{} = amqp_channel:call(Channel, Get),
+    amqp_channel:cast(Channel, #'basic.ack'{delivery_tag = Tag2}),
+
+    %% Float
+    publish_message(Channel, <<"test">>, 4.2),
+    publish_message(Channel, <<"test">>, 4.2),
+
+    {#'basic.get_ok'{delivery_tag = Tag3}, _} = amqp_channel:call(Channel, Get),
+    #'basic.get_empty'{} = amqp_channel:call(Channel, Get),
+    amqp_channel:cast(Channel, #'basic.ack'{delivery_tag = Tag3}),
+
+    %% None/null/nil/void/undefined
+    publish_message(Channel, <<"test">>, undefined),
+    publish_message(Channel, <<"test">>, undefined),
+
+    {#'basic.get_ok'{delivery_tag = Tag4}, _} = amqp_channel:call(Channel, Get),
+    #'basic.get_empty'{} = amqp_channel:call(Channel, Get),
+    amqp_channel:cast(Channel, #'basic.ack'{delivery_tag = Tag4}),
 
     %% Deduplication header absent
     publish_message(Channel, <<"test">>),
@@ -146,6 +173,25 @@ queue_overflow(Config) ->
                                             ]
                                  }}} = amqp_channel:call(Channel, Get).
 
+dead_letter(Config) ->
+    Get = #'basic.get'{queue = <<"test">>},
+    Channel = rabbit_ct_client_helpers:open_channel(Config),
+
+    Args = [{<<"x-dead-letter-exchange">>, longstr, "amq.direct"}],
+    #'queue.declare_ok'{} = amqp_channel:call(Channel,
+                                              make_queue(<<"test">>, Args)),
+    bind_new_exchange(Channel, <<"test">>, <<"test">>),
+
+    publish_message(Channel, <<"test">>, "deduplicate-this"),
+
+    {#'basic.get_ok'{delivery_tag = Tag}, _} = amqp_channel:call(Channel, Get),
+
+    amqp_channel:cast(Channel, #'basic.reject'{delivery_tag = Tag, requeue = false}),
+
+    publish_message(Channel, <<"test">>, "deduplicate-this"),
+
+    {#'basic.get_ok'{}, _} = amqp_channel:call(Channel, Get).
+
 %% -------------------------------------------------------------------
 %% Utility functions.
 %% -------------------------------------------------------------------
@@ -173,7 +219,13 @@ publish_message(Ch, Ex) ->
     amqp_channel:cast(Ch, Publish, Msg).
 
 publish_message(Ch, Ex, D) ->
-    Props = #'P_basic'{headers = [{<<"x-deduplication-header">>, longstr, D}]},
+    Type = case D of
+               D when is_integer(D) -> long;
+               D when is_float(D) -> float;
+               D when is_list(D) -> longstr;
+               undefined -> void
+           end,
+    Props = #'P_basic'{headers = [{<<"x-deduplication-header">>, Type, D}]},
     Publish = #'basic.publish'{exchange = Ex, routing_key = <<"#">>},
     Msg = #amqp_msg{props = Props, payload = <<"payload">>},
     amqp_channel:cast(Ch, Publish, Msg).

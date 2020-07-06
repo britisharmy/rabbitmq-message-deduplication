@@ -1,6 +1,6 @@
 # RabbitMQ Message Deduplication Plugin
 
-[![Build Status](https://travis-ci.org/noxdafox/rabbitmq-message-deduplication.svg?branch=master)](https://travis-ci.org/noxdafox/rabbitmq-message-deduplication)
+[![Build Status](https://travis-ci.org/noxdafox/rabbitmq-message-deduplication.svg)](https://travis-ci.org/noxdafox/rabbitmq-message-deduplication)
 
 A plugin for filtering duplicate messages.
 
@@ -10,9 +10,10 @@ Messages can be deduplicated when published into an exchange or enqueued to a qu
 
 Supported RabbitMQ versions:
 
- * \>= 3.7.0
+ * \>= 3.7.17 use release marked `v3.8.x`
+ * \>= 3.7.0 \<= 3.7.16 use release marked `v3.7.x`
 
-Download the .ez files from the latest [release](https://github.com/noxdafox/rabbitmq-message-deduplication/releases) and copy them in the [RabbitMQ plugins directory](http://www.rabbitmq.com/relocate.html).
+Download the `.ez` files from the chosen [release](https://github.com/noxdafox/rabbitmq-message-deduplication/releases) and copy them into the [RabbitMQ plugins directory](http://www.rabbitmq.com/relocate.html).
 
 Enable the plugin:
 
@@ -68,14 +69,11 @@ A queue declared with the `x-message-deduplication` parameter enabled will filte
 
 Each message containing the `x-deduplication-header` header will not be enqueued if another message with the same header is already present within the queue.
 
+> **_NOTE:_**  Mirrored and Quorum queues are currently not supported.
+
 ### Declare a queue
 
 When declaring a queue, it is possible to enable message deduplication via the `x-message-deduplication` boolean argument.
-
-Extra arguments:
-
-  * `x-cache-persistence`: whether the duplicates cache will persist on disk or in memory.
-    This parameter is optional. Default persistence type is `memory`.
 
 ### Message headers
 

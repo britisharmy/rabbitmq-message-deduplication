@@ -2,47 +2,69 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 #
-# Copyright (c) 2017-2018, Matteo Cafasso.
+# Copyright (c) 2017-2019, Matteo Cafasso.
 # All rights reserved.
-
 
 defmodule RabbitMQ.MessageDeduplicationPlugin.Cache do
   @moduledoc """
   Simple cache implemented on top of Mnesia.
 
-  Entrys can be stored within the cache with a given TTL.
+  Entries can be stored within the cache with a given TTL.
   After the TTL expires the entrys will be transparently removed.
 
-  The cache does not implement a FIFO mechanism due to Mnesia API limitations.
-  An FIFO mechanism could be implemented using ordered_sets
-  but performance should be evaluated.
+  When the cache is full, a random element is removed to make space to a new one.
+  A FIFO approach would be preferrable but impractical by now due to Mnesia limitations.
 
   """
-
-  use GenServer
 
   alias :os, as: Os
   alias :timer, as: Timer
   alias :erlang, as: Erlang
   alias :mnesia, as: Mnesia
 
-  ## Client API
+  @table_wait_time Timer.seconds(30)
 
   @doc """
-  Create a new cache and start it.
+  Create a new cache with the given name and options.
   """
-  @spec start_link(atom, list) :: :ok | { :error, any }
-  def start_link(cache, options) do
-    GenServer.start_link(__MODULE__, {cache, options}, name: cache)
+  @spec create(atom, list) :: :ok | { :error, any }
+  def create(cache, options) do
+    Mnesia.start()
+
+    case cache_create(cache, options) do
+      {_, reason} -> {:error, reason}
+      result -> result
+    end
   end
 
   @doc """
-  Put the given entry into the cache.
+  Insert the given entry into the cache if it doesn't exist.
   The TTL controls the lifetime in milliseconds of the entry.
+
+  If the cache is full, an entry will be removed to make space.
+
   """
-  @spec put(atom, any, integer | nil) :: :ok | { :error, any }
-  def put(cache, entry, ttl \\ nil) do
-    GenServer.call(cache, {:put, cache, entry, ttl})
+  @spec insert(atom, any, integer | nil) ::
+    { :ok, :inserted | :exists } | { :error, any }
+  def insert(cache, entry, ttl \\ nil) do
+    function = fn ->
+      if cache_member?(cache, entry) do
+        :exists
+      else
+        if cache_full?(cache) do
+          cache_delete_first(cache)
+        end
+
+        Mnesia.write({cache, entry, entry_expiration(cache, ttl)})
+
+        :inserted
+      end
+    end
+
+    case Mnesia.transaction(function) do
+      {:atomic, result} -> {:ok, result}
+      {:aborted, reason} -> {:error, reason}
+    end
   end
 
   @doc """
@@ -50,15 +72,10 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Cache do
   """
   @spec delete(atom, any) :: :ok | { :error, any }
   def delete(cache, entry) do
-    GenServer.call(cache, {:delete, cache, entry})
-  end
-
-  @doc """
-  True if the entry is contained within the cache.
-  """
-  @spec delete(atom, any) :: boolean
-  def member?(cache, entry) do
-    GenServer.call(cache, {:member?, cache, entry})
+    case Mnesia.transaction(fn -> Mnesia.delete({cache, entry}) end) do
+      {:atomic, :ok} -> :ok
+      {:aborted, reason} -> {:error, reason}
+    end
   end
 
   @doc """
@@ -66,7 +83,10 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Cache do
   """
   @spec flush(atom) :: :ok | { :error, any }
   def flush(cache) do
-    GenServer.call(cache, {:flush, cache})
+    case Mnesia.clear_table(cache) do
+      {:atomic, :ok} -> :ok
+      {:aborted, reason} -> {:error, reason}
+    end
   end
 
   @doc """
@@ -74,96 +94,48 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Cache do
   """
   @spec drop(atom) :: :ok | { :error, any }
   def drop(cache) do
-    GenServer.call(cache, {:drop, cache})
+    case Mnesia.delete_table(cache) do
+      {:atomic, :ok} -> :ok
+      {:aborted, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Remove all entries which TTL has expired.
+  """
+  @spec delete_expired_entries(atom) :: :ok | { :error, any }
+  def delete_expired_entries(cache) do
+    select = fn ->
+      Mnesia.select(cache, [{{cache, :"$1", :"$2"},
+                             [{:>, Os.system_time(:millisecond), :"$2"}],
+                             [:"$1"]}])
+    end
+
+    delete = fn x -> Enum.each(x, fn e -> Mnesia.delete({cache, e}) end) end
+
+    case Mnesia.transaction(select) do
+      {:atomic, expired} -> case Mnesia.transaction(delete, [expired], 1) do
+                              {:atomic, :ok} -> :ok
+                              {:aborted, reason} -> {:error, reason}
+                            end
+      {:aborted, {:no_exists, _}} -> {:error, :no_cache}
+    end
   end
 
   @doc """
   Return information related to the given cache.
   """
-  @spec drop(atom) :: list
+  @spec info(atom) :: list
   def info(cache) do
-    GenServer.call(cache, {:info, cache})
-  end
-
-  ## Server Callbacks
-
-  # Creates the Mnesia table and starts the janitor process.
-  def init({cache, options}) do
-    Mnesia.start()
-
-    :ok = cache_create(cache, options)
-
-    Process.send_after(cache, {:cache, cache}, Timer.seconds(3))
-
-    {:ok, %{}}
-  end
-
-  # The janitor process deletes expired cache entries.
-  def handle_info({:cache, cache}, state) do
-    {_, result} = cache_delete_expired(cache)
-    if (result == :ok) do
-      Process.send_after(cache, {:cache, cache}, Timer.seconds(3))
-    end
-
-    {:noreply, state}
-  end
-
-  # Puts a new entry in the cache.
-  # If the cache is full, remove an element to make space.
-  def handle_call({:put, cache, entry, ttl}, _from, state) do
-    if cache_full?(cache) do
-      cache_delete_first(cache)
-    end
-
-    Mnesia.transaction(fn ->
-      Mnesia.write({cache, entry, entry_expiration(cache, ttl)})
-    end)
-
-    {:reply, :ok, state}
-  end
-
-  # Removes the given entry from the cache.
-  def handle_call({:delete, cache, entry}, _from, state) do
-    Mnesia.transaction(fn ->
-      Mnesia.delete({cache, entry})
-    end)
-
-    {:reply, :ok, state}
-  end
-
-  # True if the entry is in the cache.
-  def handle_call({:member?, cache, entry}, _from, state) do
-    {:reply, cache_member?(cache, entry), state}
-  end
-
-  # Flush the Mnesia cache table.
-  def handle_call({:flush, cache}, _from, state) do
-    case Mnesia.clear_table(cache) do
-      {:atomic, :ok} -> {:reply, :ok, state}
-      _ -> {:reply, :error, state}
-    end
-  end
-
-  # Drop the Mnesia cache table.
-  def handle_call({:drop, cache}, _from, state) do
-    case Mnesia.delete_table(cache) do
-      {:atomic, :ok} -> {:reply, :ok, state}
-      _ -> {:reply, :error, state}
-    end
-  end
-
-  # Return cache information: number of elements and max size
-  def handle_call({:info, cache}, _from, state) do
     info = [
       bytes: Mnesia.table_info(cache, :memory) * Erlang.system_info(:wordsize),
       entries: Mnesia.table_info(cache, :size)
     ]
-    info = case cache_property(cache, :limit) do
-             number when is_integer(number) -> [size: number] ++ info
-             nil -> info
-           end
 
-    {:reply, info, state}
+    case cache_property(cache, :limit) do
+      number when is_integer(number) -> [size: number] ++ info
+      nil -> info
+    end
   end
 
   ## Utility functions
@@ -175,50 +147,42 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Cache do
                     :memory -> :ram_copies
                   end
     options = [{:attributes, [:entry, :expiration]},
-               {persistence, [node()]},
+               {persistence, cache_replicas()},
                {:index, [:expiration]},
                {:user_properties, [{:limit, Keyword.get(options, :size)},
                                    {:default_ttl, Keyword.get(options, :ttl)}]}]
 
-    Mnesia.create_table(cache, options)
-    Mnesia.add_table_copy(cache, node(), persistence)
-    Mnesia.wait_for_tables([cache], Timer.seconds(30))
+    case Mnesia.create_table(cache, options) do
+      {:atomic, :ok} ->
+        Mnesia.wait_for_tables([cache], @table_wait_time)
+      {:aborted, {:already_exists, _}} ->
+        Mnesia.wait_for_tables([cache], @table_wait_time)
+      error -> error
+    end
   end
 
-  # Mnesia cache lookup. The entry is not returned if expired.
+  # Lookup the entry within the cache, deletes the entry if expired
+  # Must be included within transaction.
   defp cache_member?(cache, entry) do
-    {:atomic, entries} = Mnesia.transaction(fn -> Mnesia.read(cache, entry) end)
-
-    case List.keyfind(entries, entry, 1) do
-      {_, _, expiration} -> expiration > Os.system_time(:millisecond)
+    case cache |> Mnesia.read(entry) |> List.keyfind(entry, 1) do
+      {_, _, expiration} -> if expiration <= Os.system_time(:millisecond) do
+                              Mnesia.delete({cache, entry})
+                              false
+                            else
+                              true
+                            end
       nil -> false
-    end
-  end
-
-  # Remove all expired entries from the Mnesia cache.
-  defp cache_delete_expired(cache) do
-    select = fn ->
-      Mnesia.select(cache, [{{cache, :"$1", :"$2"},
-                             [{:>, Os.system_time(:millisecond), :"$2"}],
-                             [:"$1"]}])
-    end
-
-    case Mnesia.transaction(select) do
-      {:atomic, expired} ->
-        Mnesia.transaction(
-          fn ->
-            Enum.each(expired, fn e -> Mnesia.delete({cache, e}) end)
-          end)
-      {:aborted, {:no_exists, _}} -> {:aborted, :no_cache}
     end
   end
 
   # Delete the first element from the cache.
   # As the Mnesia Set is not ordered, the first element is random.
+  # Must be included within transaction.
   defp cache_delete_first(cache) do
-    Mnesia.transaction(fn -> Mnesia.delete({cache, Mnesia.first(cache)}) end)
+    Mnesia.delete({cache, Mnesia.first(cache)})
   end
 
+  # True if the cache is full, false otherwise.
   defp cache_full?(cache) do
     Mnesia.table_info(cache, :size) >= cache_property(cache, :limit)
   end
@@ -242,5 +206,12 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Cache do
       |> Enum.find(fn(element) -> match?({^property, _}, element) end)
 
     entry
+  end
+
+  # List the nodes on which to create the cache replicas.
+  # Cache is replicated on two-third of the cluster nodes.
+  defp cache_replicas() do
+    nodes = [Node.self() | Node.list()]
+    nodes |> Enum.split(round((length(nodes) * 2) / 3)) |> elem(0)
   end
 end

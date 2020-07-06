@@ -2,7 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 #
-# Copyright (c) 2017-2018, Matteo Cafasso.
+# Copyright (c) 2017-2019, Matteo Cafasso.
 # All rights reserved.
 
 defmodule RabbitMQ.MessageDeduplicationPlugin.Cache.Test do
@@ -10,7 +10,7 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Cache.Test do
 
   alias :timer, as: Timer
   alias :mnesia, as: Mnesia
-  alias RabbitMQ.MessageDeduplicationPlugin.Cache, as: MessageCache
+  alias RabbitMQ.MessageDeduplicationPlugin.Cache, as: Cache
 
   setup do
     cache = :test_cache
@@ -27,113 +27,99 @@ defmodule RabbitMQ.MessageDeduplicationPlugin.Cache.Test do
     cache_options = [size: 1, ttl: nil, persistence: :memory]
     cache_ttl_options = [size: 1, ttl: Timer.seconds(1), persistence: :memory]
 
-    start_supervised!(%{id: cache,
-                        start: {MessageCache,
-                                :start_link,
-                                [cache, cache_options]}})
-    start_supervised!(%{id: cache_ttl,
-                        start: {MessageCache,
-                                :start_link,
-                                [cache_ttl, cache_ttl_options]}})
-    start_supervised!(%{id: cache_simple,
-                        start: {MessageCache,
-                                :start_link,
-                                [cache_simple, cache_simple_options]}})
+    :ok = Cache.create(cache, cache_options)
+    :ok = Cache.create(cache_ttl, cache_ttl_options)
+    :ok = Cache.create(cache_simple, cache_simple_options)
 
     %{cache: cache, cache_ttl: cache_ttl, cache_simple: cache_simple}
   end
 
-  test "basic insertion and lookup",
+  test "basic insertion",
       %{cache: cache, cache_ttl: _, cache_simple: _} do
-    assert MessageCache.member?(cache, "foo") == false
-
-    MessageCache.put(cache, "foo")
-    assert MessageCache.member?(cache, "foo") == true
+    {:ok, :inserted} = Cache.insert(cache, "foo")
+    {:ok, :exists} = Cache.insert(cache, "foo")
   end
 
   test "TTL at insertion",
       %{cache: cache, cache_ttl: _, cache_simple: _} do
-    assert MessageCache.member?(cache, "foo") == false
-
-    MessageCache.put(cache, "foo", Timer.seconds(1))
-    assert MessageCache.member?(cache, "foo") == true
+    {:ok, :inserted} = Cache.insert(cache, "foo", Timer.seconds(1))
+    {:ok, :exists} = Cache.insert(cache, "foo")
 
     1 |> Timer.seconds() |> Timer.sleep()
 
-    assert MessageCache.member?(cache, "foo") == false
+    :ok = Cache.delete_expired_entries(cache)
+
+    {:ok, :inserted} = Cache.insert(cache, "foo")
   end
 
   test "TTL at table creation",
       %{cache: _, cache_ttl: cache, cache_simple: _} do
-    assert MessageCache.member?(cache, "foo") == false
-
-    MessageCache.put(cache, "foo")
-    assert MessageCache.member?(cache, "foo") == true
+    {:ok, :inserted} = Cache.insert(cache, "foo")
+    {:ok, :exists} = Cache.insert(cache, "foo")
 
     1 |> Timer.seconds() |> Timer.sleep()
 
-    assert MessageCache.member?(cache, "foo") == false
+    :ok = Cache.delete_expired_entries(cache)
+
+    {:ok, :inserted} = Cache.insert(cache, "foo")
   end
 
   test "entries are deleted after TTL",
       %{cache: cache, cache_ttl: _, cache_simple: _} do
-    assert MessageCache.member?(cache, "foo") == false
+    {:ok, :inserted} = Cache.insert(cache, "foo", Timer.seconds(1))
+    {:ok, :exists} = Cache.insert(cache, "foo")
 
-    MessageCache.put(cache, "foo", Timer.seconds(1))
-    assert MessageCache.member?(cache, "foo") == true
+    Timer.sleep(1200)
 
-    Timer.sleep(3200)
+    :ok = Cache.delete_expired_entries(cache)
 
-    assert Mnesia.transaction(fn -> Mnesia.all_keys(cache) end) == {:atomic, []}
+    {:atomic, []} = Mnesia.transaction(fn -> Mnesia.all_keys(cache) end)
   end
 
   test "entries are deleted if cache is full",
       %{cache: cache, cache_ttl: _, cache_simple: _} do
-    assert MessageCache.member?(cache, "foo") == false
-    assert MessageCache.member?(cache, "bar") == false
+    {:ok, :inserted} = Cache.insert(cache, "foo")
+    {:ok, :exists} = Cache.insert(cache, "foo")
+    {:ok, :inserted} = Cache.insert(cache, "bar")
+    {:ok, :exists} = Cache.insert(cache, "bar")
 
-    MessageCache.put(cache, "foo")
-    assert MessageCache.member?(cache, "foo") == true
-    MessageCache.put(cache, "bar")
-    assert MessageCache.member?(cache, "bar") == true
-
-    assert MessageCache.member?(cache, "foo") == false
+    {:ok, :inserted} = Cache.insert(cache, "foo")
   end
 
   test "cache entry deletion", %{cache: cache, cache_ttl: _, cache_simple: _} do
-    MessageCache.put(cache, "foo")
-    assert MessageCache.member?(cache, "foo") == true
+    {:ok, :inserted} = Cache.insert(cache, "foo")
+    {:ok, :exists} = Cache.insert(cache, "foo")
 
-    MessageCache.delete(cache, "foo")
+    Cache.delete(cache, "foo")
 
-    assert MessageCache.member?(cache, "foo") == false
+    {:ok, :inserted} = Cache.insert(cache, "foo")
   end
 
   test "cache information",
       %{cache: cache, cache_ttl: _, cache_simple: _} do
-    MessageCache.put(cache, "foo")
+    {:ok, :inserted} = Cache.insert(cache, "foo")
 
-    [size: 1, bytes: _, entries: 1] = MessageCache.info(cache)
+    [size: 1, bytes: _, entries: 1] = Cache.info(cache)
   end
 
   test "simple cache information",
       %{cache: _, cache_ttl: _, cache_simple: cache_simple} do
-    MessageCache.put(cache_simple, "foo")
+    {:ok, :inserted} = Cache.insert(cache_simple, "foo")
 
-    [bytes: _, entries: 1] = MessageCache.info(cache_simple)
+    [bytes: _, entries: 1] = Cache.info(cache_simple)
   end
 
   test "flush the cache", %{cache: cache, cache_ttl: _, cache_simple: _} do
-    MessageCache.put(cache, "foo")
-    assert MessageCache.member?(cache, "foo") == true
+    {:ok, :inserted} = Cache.insert(cache, "foo")
+    {:ok, :exists} = Cache.insert(cache, "foo")
 
-    :ok = MessageCache.flush(cache)
+    :ok = Cache.flush(cache)
 
-    assert MessageCache.member?(cache, "foo") == false
+    {:ok, :inserted} = Cache.insert(cache, "foo")
   end
 
   test "drop the cache", %{cache: cache, cache_ttl: _, cache_simple: _} do
-    :ok = MessageCache.drop(cache)
+    :ok = Cache.drop(cache)
 
     assert Enum.member?(Mnesia.system_info(:tables), cache) == false
   end
